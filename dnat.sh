@@ -2,7 +2,8 @@
 # ===============================================
 # 动态 DNAT 管理脚本（图形化菜单版）
 # Author: ARLOOR (优化版)
-# 自动安装依赖，支持 IPv4/IPV6，日志记录
+# 新增功能：删除所有转发规则及服务
+# 退出选项改为 0
 # ===============================================
 
 set -euo pipefail
@@ -60,13 +61,11 @@ dnat_add() {
     read -rp "目标域名/IP: " remotehost
     read -rp "目标端口号: " remoteport
 
-    # 检查端口数字
     if ! [[ $localport =~ ^[0-9]+$ ]] || ! [[ $remoteport =~ ^[0-9]+$ ]]; then
         echo -e "${red}端口必须为数字${black}"
         return
     fi
 
-    # 解析域名
     if [[ $remotehost =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         remoteip=$remotehost
     else
@@ -85,7 +84,6 @@ dnat_add() {
     iptables -t nat -A POSTROUTING -p tcp -d $remoteip --dport $remoteport -j SNAT --to-source $localIP
     iptables -t nat -A POSTROUTING -p udp -d $remoteip --dport $remoteport -j SNAT --to-source $localIP
 
-    # 保存规则到配置文件
     if ! grep -q "^$localport>$remotehost:$remoteport" $CONF; then
         echo "$localport>$remotehost:$remoteport" >> $CONF
     fi
@@ -94,12 +92,19 @@ dnat_add() {
 }
 
 # =============================
-# 删除 DNAT 规则
+# 删除单个 DNAT 规则
 # =============================
 dnat_remove() {
     read -rp "本地端口号: " localport
     sed -i "/^$localport>.*/d" $CONF
-    # 清空 NAT 表并重新加载配置
+    reload_dnat
+    echo -e "${green}删除完成${black}" | tee -a $LOGFILE
+}
+
+# =============================
+# 重载 DNAT 配置
+# =============================
+reload_dnat() {
     iptables -t nat -F PREROUTING
     iptables -t nat -F POSTROUTING
     while read -r line; do
@@ -113,7 +118,35 @@ dnat_remove() {
             iptables -t nat -A POSTROUTING -p udp -d $host --dport $rp -j SNAT --to-source $localIP
         fi
     done < $CONF
-    echo -e "${green}删除完成${black}" | tee -a $LOGFILE
+}
+
+# =============================
+# 删除所有 DNAT 规则和服务
+# =============================
+dnat_remove_all() {
+    echo -e "${red}警告：将删除所有转发规则和服务！${black}"
+    read -rp "确认删除？(y/n): " confirm
+    if [[ $confirm != "y" ]]; then
+        echo "已取消"
+        return
+    fi
+
+    # 删除规则
+    iptables -t nat -F PREROUTING
+    iptables -t nat -F POSTROUTING
+    rm -f $CONF
+    mkdir -p $BASE
+    touch $CONF
+    echo -e "${green}已删除所有转发规则${black}" | tee -a $LOGFILE
+
+    # 删除 systemd 服务
+    if systemctl list-unit-files | grep -q dnat.service; then
+        systemctl stop dnat
+        systemctl disable dnat
+        rm -f /lib/systemd/system/dnat.service
+        systemctl daemon-reload
+        echo -e "${green}已删除 DNAT 服务${black}" | tee -a $LOGFILE
+    fi
 }
 
 # =============================
@@ -152,15 +185,17 @@ while true; do
     echo "2) 删除转发规则"
     echo "3) 列出所有规则"
     echo "4) 查看 iptables 配置"
-    echo "5) 退出"
+    echo "5) 删除所有转发规则及服务"
+    echo "0) 退出"
     echo "====================================="
-    read -rp "请选择操作 [1-5]: " choice
+    read -rp "请选择操作 [0-5]: " choice
     case $choice in
         1) dnat_add ;;
         2) dnat_remove ;;
         3) dnat_list ;;
         4) dnat_show ;;
-        5) exit 0 ;;
+        5) dnat_remove_all ;;
+        0) exit 0 ;;
         *) echo -e "${red}无效选择${black}" ;;
     esac
     read -rp "按回车继续..."
