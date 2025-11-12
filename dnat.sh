@@ -1,9 +1,10 @@
 #!/bin/bash
 # ===============================================
-# 动态 DNAT 管理脚本（图形化菜单版）
-# Author: ARLOOR (优化版)
+# 动态 DNAT 管理脚本（图形化菜单版） - 修正版（MASQUERADE + 出网口自动选择）
+# Author: ARLOOR (优化版 by ChatGPT)
 # 新增功能：删除所有转发规则及服务
 # 退出选项改为 0
+# 主要修复：避免 localIP 为多行导致 "Bad argument `172.17.0.1`"
 # ===============================================
 
 set -euo pipefail
@@ -16,12 +17,40 @@ black="\033[0m"
 
 # 基础目录
 BASE=/etc/dnat
-CONF=$BASE/conf
-mkdir -p $BASE
-touch $CONF
+CONF="$BASE/conf"
+mkdir -p "$BASE"
+touch "$CONF"
 
-LOGFILE=$BASE/dnat.log
-echo "$(date '+%F %T') - DNAT管理脚本启动" >> $LOGFILE
+LOGFILE="$BASE/dnat.log"
+echo "$(date '+%F %T') - DNAT管理脚本启动" >> "$LOGFILE"
+
+# =============================
+# 工具函数
+# =============================
+
+# 返回给定目的IP/域名的出网接口名（例如 eth0）
+get_out_iface() {
+    local dst="$1"
+    # 先把域名解析为IP（若已是IP则保持）
+    local ip
+    if [[ "$dst" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip="$dst"
+    else
+        ip=$(host -t a "$dst" | awk '/has address/ {print $4; exit}')
+    fi
+    [[ -z "${ip:-}" ]] && return 1
+    ip route get "$ip" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+# 将域名解析为单个IPv4（若已是IP则直接返回）
+resolve_ip() {
+    local host="$1"
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$host"
+    else
+        host -t a "$host" | awk '/has address/ {print $4; exit}'
+    fi
+}
 
 # =============================
 # 自动安装依赖
@@ -44,7 +73,7 @@ install_dependencies() {
 # 启用 IP 转发和开放 FORWARD 链
 # =============================
 enable_nat() {
-    echo -e "${green}开启端口转发与 NAT${black}" | tee -a $LOGFILE
+    echo -e "${green}开启端口转发与 NAT${black}" | tee -a "$LOGFILE"
     sysctl -w net.ipv4.ip_forward=1
     sysctl -w net.ipv6.conf.all.forwarding=1
     grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
@@ -54,41 +83,49 @@ enable_nat() {
 }
 
 # =============================
-# 添加 DNAT 规则
+# 添加 DNAT 规则（使用 MASQUERADE，自动选择出网口）
 # =============================
 dnat_add() {
     read -rp "本地端口号: " localport
     read -rp "目标域名/IP: " remotehost
     read -rp "目标端口号: " remoteport
 
-    if ! [[ $localport =~ ^[0-9]+$ ]] || ! [[ $remoteport =~ ^[0-9]+$ ]]; then
+    if ! [[ "$localport" =~ ^[0-9]+$ ]] || ! [[ "$remoteport" =~ ^[0-9]+$ ]]; then
         echo -e "${red}端口必须为数字${black}"
         return
     fi
 
-    if [[ $remotehost =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        remoteip=$remotehost
-    else
-        remoteip=$(host -t a $remotehost | awk '/has address/ {print $4; exit}')
-        if [[ -z $remoteip ]]; then
-            echo -e "${red}域名解析失败${black}"
-            return
-        fi
+    local remoteip
+    remoteip="$(resolve_ip "$remotehost")"
+    if [[ -z "${remoteip:-}" ]]; then
+        echo -e "${red}域名解析失败${black}"
+        return
     fi
 
-    local localIP
-    localIP=$(ip -o -4 addr list | awk '{print $4}' | cut -d/ -f1 | grep -v '^127\.') 
-
-    iptables -t nat -A PREROUTING -p tcp --dport $localport -j DNAT --to-destination $remoteip:$remoteport
-    iptables -t nat -A PREROUTING -p udp --dport $localport -j DNAT --to-destination $remoteip:$remoteport
-    iptables -t nat -A POSTROUTING -p tcp -d $remoteip --dport $remoteport -j SNAT --to-source $localIP
-    iptables -t nat -A POSTROUTING -p udp -d $remoteip --dport $remoteport -j SNAT --to-source $localIP
-
-    if ! grep -q "^$localport>$remotehost:$remoteport" $CONF; then
-        echo "$localport>$remotehost:$remoteport" >> $CONF
+    local out_if
+    out_if="$(get_out_iface "$remoteip" || true)"
+    if [[ -z "${out_if:-}" ]]; then
+        echo -e "${red}无法确定出网接口${black}"
+        return
     fi
 
-    echo -e "${green}添加成功: $localport -> $remotehost:$remoteport${black}" | tee -a $LOGFILE
+    # DNAT（TCP/UDP）
+    iptables -t nat -A PREROUTING -p tcp --dport "$localport" -j DNAT --to-destination "$remoteip:$remoteport" \
+        -m comment --comment "dnat:${localport}->${remotehost}:${remoteport}"
+    iptables -t nat -A PREROUTING -p udp --dport "$localport" -j DNAT --to-destination "$remoteip:$remoteport" \
+        -m comment --comment "dnat:${localport}->${remotehost}:${remoteport}"
+
+    # POSTROUTING 使用 MASQUERADE，不再手写 --to-source，避免多IP问题
+    iptables -t nat -A POSTROUTING -p tcp -d "$remoteip" --dport "$remoteport" -o "$out_if" -j MASQUERADE \
+        -m comment --comment "snat:${localport}->${remotehost}:${remoteport}"
+    iptables -t nat -A POSTROUTING -p udp -d "$remoteip" --dport "$remoteport" -o "$out_if" -j MASQUERADE \
+        -m comment --comment "snat:${localport}->${remotehost}:${remoteport}"
+
+    if ! grep -q "^$localport>$remotehost:$remoteport" "$CONF"; then
+        echo "$localport>$remotehost:$remoteport" >> "$CONF"
+    fi
+
+    echo -e "${green}添加成功: $localport -> $remotehost:$remoteport（出网口：$out_if）${black}" | tee -a "$LOGFILE"
 }
 
 # =============================
@@ -96,28 +133,42 @@ dnat_add() {
 # =============================
 dnat_remove() {
     read -rp "本地端口号: " localport
-    sed -i "/^$localport>.*/d" $CONF
+    sed -i "/^$localport>.*/d" "$CONF"
     reload_dnat
-    echo -e "${green}删除完成${black}" | tee -a $LOGFILE
+    echo -e "${green}删除完成${black}" | tee -a "$LOGFILE"
 }
 
 # =============================
-# 重载 DNAT 配置
+# 重载 DNAT 配置（使用 MASQUERADE，自动选择出网口）
 # =============================
 reload_dnat() {
     iptables -t nat -F PREROUTING
     iptables -t nat -F POSTROUTING
     while read -r line; do
+        [[ -z "$line" ]] && continue
         IFS='>: ' read -r lp host rp <<< "$line"
-        if [[ -n "$lp" && -n "$host" && -n "$rp" ]]; then
-            local localIP
-            localIP=$(ip -o -4 addr list | awk '{print $4}' | cut -d/ -f1 | grep -v '^127\.') 
-            iptables -t nat -A PREROUTING -p tcp --dport $lp -j DNAT --to-destination $host:$rp
-            iptables -t nat -A PREROUTING -p udp --dport $lp -j DNAT --to-destination $host:$rp
-            iptables -t nat -A POSTROUTING -p tcp -d $host --dport $rp -j SNAT --to-source $localIP
-            iptables -t nat -A POSTROUTING -p udp -d $host --dport $rp -j SNAT --to-source $localIP
+        if [[ -n "${lp:-}" && -n "${host:-}" && -n "${rp:-}" ]]; then
+            local host_ip
+            host_ip="$(resolve_ip "$host")"
+            [[ -z "${host_ip:-}" ]] && continue
+
+            local out_if
+            out_if="$(get_out_iface "$host_ip" || true)"
+            [[ -z "${out_if:-}" ]] && continue
+
+            # DNAT
+            iptables -t nat -A PREROUTING -p tcp --dport "$lp" -j DNAT --to-destination "$host_ip:$rp" \
+                -m comment --comment "dnat:${lp}->${host}:${rp}"
+            iptables -t nat -A PREROUTING -p udp --dport "$lp" -j DNAT --to-destination "$host_ip:$rp" \
+                -m comment --comment "dnat:${lp}->${host}:${rp}"
+
+            # MASQUERADE
+            iptables -t nat -A POSTROUTING -p tcp -d "$host_ip" --dport "$rp" -o "$out_if" -j MASQUERADE \
+                -m comment --comment "snat:${lp}->${host}:${rp}"
+            iptables -t nat -A POSTROUTING -p udp -d "$host_ip" --dport "$rp" -o "$out_if" -j MASQUERADE \
+                -m comment --comment "snat:${lp}->${host}:${rp}"
         fi
-    done < $CONF
+    done < "$CONF"
 }
 
 # =============================
@@ -126,7 +177,7 @@ reload_dnat() {
 dnat_remove_all() {
     echo -e "${red}警告：将删除所有转发规则和服务！${black}"
     read -rp "确认删除？(y/n): " confirm
-    if [[ $confirm != "y" ]]; then
+    if [[ "$confirm" != "y" ]]; then
         echo "已取消"
         return
     fi
@@ -134,18 +185,18 @@ dnat_remove_all() {
     # 删除规则
     iptables -t nat -F PREROUTING
     iptables -t nat -F POSTROUTING
-    rm -f $CONF
-    mkdir -p $BASE
-    touch $CONF
-    echo -e "${green}已删除所有转发规则${black}" | tee -a $LOGFILE
+    rm -f "$CONF"
+    mkdir -p "$BASE"
+    touch "$CONF"
+    echo -e "${green}已删除所有转发规则${black}" | tee -a "$LOGFILE"
 
     # 删除 systemd 服务
     if systemctl list-unit-files | grep -q dnat.service; then
-        systemctl stop dnat
-        systemctl disable dnat
+        systemctl stop dnat || true
+        systemctl disable dnat || true
         rm -f /lib/systemd/system/dnat.service
         systemctl daemon-reload
-        echo -e "${green}已删除 DNAT 服务${black}" | tee -a $LOGFILE
+        echo -e "${green}已删除 DNAT 服务${black}" | tee -a "$LOGFILE"
     fi
 }
 
@@ -154,7 +205,7 @@ dnat_remove_all() {
 # =============================
 dnat_list() {
     echo -e "${yellow}当前 DNAT 配置:${black}"
-    cat $CONF
+    cat "$CONF"
 }
 
 # =============================
@@ -189,7 +240,7 @@ while true; do
     echo "0) 退出"
     echo "====================================="
     read -rp "请选择操作 [0-5]: " choice
-    case $choice in
+    case "$choice" in
         1) dnat_add ;;
         2) dnat_remove ;;
         3) dnat_list ;;
