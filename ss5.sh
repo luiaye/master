@@ -35,12 +35,12 @@ esac
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
-# 版本号获取（保留你的写法）
+# 版本号获取
 VER=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | \
       sed -n "s/.*\\\"tag_name\\\": \\\"\\(v[^\\\"]*\\)\\\".*/\\1/p")
 [ -z "$VER" ] && echo "获取 Xray 版本失败" && exit 1
 
-# 下载：加 -L（很关键）
+# 下载
 curl -fL \
   https://github.com/XTLS/Xray-core/releases/download/${VER}/Xray-linux-${XRAY_ARCH}.zip \
   -o $TMPDIR/xray.zip
