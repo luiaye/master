@@ -1,7 +1,7 @@
 bash -c '
 set -e
 
-PORT=3322
+PORT=33322
 LISTEN="0.0.0.0"
 USER="admin"
 PASS="YUL3ojLD"
